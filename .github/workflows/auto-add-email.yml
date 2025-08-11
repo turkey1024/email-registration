@@ -1,0 +1,126 @@
+name: Auto Add Email Forwarding
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  process-email:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR changes
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0  # 获取完整提交历史
+
+      - name: Find new JSON files
+        id: find-json
+        run: |
+          echo "json_files=$(find registrations/ -name '*.json')" >> $GITHUB_OUTPUT
+
+      - name: Validate and process registrations
+        if: steps.find-json.outputs.json_files != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+        run: |
+          # 初始化变量
+          declare -A email_count
+          failed_checks=0
+          added_rules=0
+
+          # 处理每个JSON文件
+          for file in ${{ steps.find-json.outputs.json_files }}; do
+            echo "🔍 正在处理文件: $file"
+            prefix=$(basename "$file" .json)
+            email=$(jq -r '.email' "$file")
+
+            # ---- 验证1：前缀格式检查 ----
+            if [[ ! "$prefix" =~ ^[a-z0-9-]{1,20}$ ]]; then
+              echo "❌ 错误: 前缀 '$prefix' 只能包含小写字母、数字和短横线，且长度1-20字符"
+              ((failed_checks++))
+              continue
+            fi
+
+            # ---- 验证2：邮箱格式检查 ----
+            if [[ ! "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+              echo "❌ 错误: '$email' 不是有效的邮箱地址"
+              ((failed_checks++))
+              continue
+            fi
+
+            # ---- 验证3：检查是否已存在相同前缀 ----
+            existing_rule=$(curl -s -X GET \
+              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/email/routing/rules" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | \
+              jq --arg p "$prefix@qxz.qzz.io" '.result[] | select(.matchers[0].type=="literal" and .matchers[0].value==$p)')
+
+            if [ -n "$existing_rule" ]; then
+              echo "⚠️ 警告: 前缀 '$prefix' 已存在，跳过添加"
+              continue
+            fi
+
+            # ---- 验证4：单用户最多3个注册 ----
+            email_count["$email"]=$((email_count["$email"] + 1))
+            if [ ${email_count["$email"]} -gt 3 ]; then
+              echo "❌ 错误: 邮箱 '$email' 已注册超过3个前缀"
+              ((failed_checks++))
+              continue
+            fi
+
+            # ---- 添加到Cloudflare ----
+            echo "✅ 验证通过: $prefix@qxz.qzz.io → $email"
+            response=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/email/routing/rules" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data '{
+                "matchers": [{
+                  "type": "literal",
+                  "field": "to",
+                  "value": "'"$prefix"'@qxz.qzz.io"
+                }],
+                "actions": [{
+                  "type": "forward",
+                  "value": ["'"$email"'"]
+                }],
+                "priority": 10,
+                "enabled": true,
+                "tags": ["auto-generated"]
+              }')
+
+            # 检查API响应
+            if [[ $(echo "$response" | jq -r '.success') == "true" ]]; then
+              echo "🎉 成功添加规则: $(echo "$response" | jq -r '.result.id')"
+              ((added_rules++))
+            else
+              echo "❌ API错误: $(echo "$response" | jq -r '.errors[0].message')"
+              ((failed_checks++))
+            fi
+          done
+
+          # 结果汇总
+          echo "========================================"
+          echo "📊 规则处理结果:"
+          echo "✅ 成功添加: $added_rules 条"
+          echo "❌ 失败检查: $failed_checks 条"
+          
+          # 如果有失败则终止流程
+          if [ $failed_checks -ne 0 ]; then
+            echo "::error::发现 $failed_checks 个错误，请检查PR内容"
+            exit 1
+          fi
+
+      - name: 清理旧规则（可选）
+        if: always()
+        run: |
+          # 删除标记为 auto-generated 的旧规则（示例）
+          echo "若要启用自动清理，请取消注释以下代码"
+          # curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/email/routing/rules" \
+          #   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | \
+          #   jq -r '.result[] | select(.tags[]? | contains("old-tag")) | .id' | \
+          #   xargs -I {} curl -X DELETE \
+          #   "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/email/routing/rules/{}" \
+          #   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
