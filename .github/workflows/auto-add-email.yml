@@ -1,0 +1,132 @@
+name: Auto Add Email Forwarding
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  process-email:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR changes
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Find new JSON files
+        id: find-json
+        run: |
+          echo "json_files=$(find registrations/ -name '*.json')" >> $GITHUB_OUTPUT
+
+      - name: Validate and process registrations
+        if: steps.find-json.outputs.json_files != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+        run: |
+          # 初始化计数器
+          declare -A email_count
+          failed_checks=0
+          added_rules=0
+
+          # 简化版JSON解析（只需要email字段）
+          get_email() {
+            jq -r '.email | select(.!=null)' "$1" 2>/dev/null || echo ""
+          }
+
+          # 处理每个文件
+          for file in ${{ steps.find-json.outputs.json_files }}; do
+            echo "🔍 Processing: $file"
+            
+            # 提取前缀和邮箱
+            prefix=$(basename "$file" .json)
+            email=$(get_email "$file")
+
+            # ---- 验证1：邮箱字段检查 ----
+            if [ -z "$email" ]; then
+              echo "❌ Error: $file 缺少必需的 email 字段或格式错误"
+              ((failed_checks++))
+              continue
+            fi
+
+            # ---- 验证2：前缀格式检查 ----
+            if [[ ! "$prefix" =~ ^[a-z0-9-]{1,20}$ ]]; then
+              echo "❌ Error: 前缀 '$prefix' 只能包含小写字母、数字和短横线"
+              ((failed_checks++))
+              continue
+            fi
+
+            # ---- 验证3：邮箱格式检查 ----
+            if [[ ! "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+              echo "❌ Error: '$email' 不是有效的邮箱地址"
+              ((failed_checks++))
+              continue
+            fi
+
+            # ---- 验证4：检查是否已存在相同前缀 ----
+            existing_rule=$(curl -s -X GET \
+              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/email/routing/rules" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | \
+              jq --arg p "$prefix@qxz.qzz.io" '.result[] | select(.matchers[0].type=="literal" and .matchers[0].value==$p)')
+
+            if [ -n "$existing_rule" ]; then
+              echo "⚠️ Warning: 前缀 '$prefix' 已存在，跳过添加"
+              continue
+            fi
+
+            # ---- 验证5：单用户最多3个注册 ----
+            email_count["$email"]=$((email_count["$email"] + 1))
+            if [ ${email_count["$email"]} -gt 3 ]; then
+              echo "❌ Error: 邮箱 '$email' 已注册超过3个前缀"
+              ((failed_checks++))
+              continue
+            fi
+
+            # ---- 添加到Cloudflare ----
+            echo "✅ Valid: $prefix@qxz.qzz.io → $email"
+            response=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/email/routing/rules" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data '{
+                "matchers": [{
+                  "type": "literal",
+                  "field": "to",
+                  "value": "'"$prefix"'@qxz.qzz.io"
+                }],
+                "actions": [{
+                  "type": "forward",
+                  "value": ["'"$email"'"]
+                }],
+                "priority": 10,
+                "enabled": true
+              }')
+
+            # 检查API响应
+            if [[ $(echo "$response" | jq -r '.success') == "true" ]]; then
+              echo "🎉 Added: $(echo "$response" | jq -r '.result.id')"
+              ((added_rules++))
+            else
+              echo "❌ API Error: $(echo "$response" | jq -r '.errors[0].message')"
+              ((failed_checks++))
+            fi
+          done
+
+          # 结果汇总
+          echo "========================================"
+          echo "📊 Result:"
+          echo "✅ Successfully added: $added_rules"
+          echo "❌ Failed checks: $failed_checks"
+          
+          if [ $failed_checks -ne 0 ]; then
+            echo "::error::Found $failed_checks errors"
+            exit 1
+          fi
+
+      - name: Post-process cleanup
+        if: always()
+        run: |
+          echo "Cleanup completed"
+
